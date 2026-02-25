@@ -256,53 +256,73 @@ section[data-testid="stSidebar"] h3 { color: #f0f8ff !important; }
 # ─────────────────────────────────────────────────────────────────
 #  API FUNCTIONS
 # ─────────────────────────────────────────────────────────────────
-BINANCE  = "https://api.binance.com/api/v3"
+KRAKEN   = "https://api.kraken.com/0/public"
 HEADERS  = {"Accept": "application/json"}
 
 @st.cache_data(ttl=30)
-def fetch_candles(symbol="BTCUSDT", interval="5m", limit=200) -> pd.DataFrame:
-    """Fetch OHLCV candles from Binance."""
+def fetch_candles(symbol="XBTUSD", interval=5, limit=200) -> pd.DataFrame:
+    """Fetch OHLCV candles from Kraken (no geo-restrictions)."""
     try:
-        r = requests.get(f"{BINANCE}/klines",
-                         params={"symbol": symbol, "interval": interval, "limit": limit},
-                         headers=HEADERS, timeout=10)
+        r = requests.get(f"{KRAKEN}/OHLC",
+                         params={"pair": symbol, "interval": interval},
+                         headers=HEADERS, timeout=12)
         r.raise_for_status()
-        raw = r.json()
+        data = r.json()
+        if data.get("error"):
+            st.error(f"Kraken error: {data['error']}")
+            return pd.DataFrame()
+        result = data.get("result", {})
+        key    = list(result.keys())[0]
+        raw    = result[key][-limit:]
         df = pd.DataFrame(raw, columns=[
-            "ts","open","high","low","close","volume",
-            "close_ts","quote_vol","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
+            "ts","open","high","low","close","vwap","volume","trades"
         ])
-        for col in ["open","high","low","close","volume","quote_vol","taker_buy_base","taker_buy_quote"]:
+        for col in ["open","high","low","close","vwap","volume"]:
             df[col] = pd.to_numeric(df[col])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df["ts"]             = pd.to_datetime(df["ts"], unit="s", utc=True)
+        df["taker_buy_base"] = df["volume"] * 0.52   # estimate ~52% buy side
+        df["quote_vol"]      = df["volume"] * df["close"]
+        df["taker_buy_quote"]= df["taker_buy_base"] * df["close"]
         return df
     except Exception as e:
-        st.error(f"Binance candles error: {e}")
+        st.error(f"Kraken candles error: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=10)
-def fetch_ticker(symbol="BTCUSDT") -> dict:
-    """Fetch 24h ticker stats."""
+def fetch_ticker(symbol="XBTUSD") -> dict:
+    """Fetch ticker stats from Kraken."""
     try:
-        r = requests.get(f"{BINANCE}/ticker/24hr",
-                         params={"symbol": symbol}, headers=HEADERS, timeout=8)
+        r = requests.get(f"{KRAKEN}/Ticker",
+                         params={"pair": symbol}, headers=HEADERS, timeout=8)
         r.raise_for_status()
-        return r.json()
+        data   = r.json()
+        result = data.get("result", {})
+        key    = list(result.keys())[0]
+        t      = result[key]
+        return {
+            "lastPrice":           t["c"][0],
+            "priceChangePercent":  str(round((float(t["c"][0]) - float(t["o"])) / float(t["o"]) * 100, 2)),
+            "highPrice":           t["h"][1],
+            "lowPrice":            t["l"][1],
+            "quoteVolume":         str(float(t["v"][1]) * float(t["c"][0])),
+        }
     except Exception:
         return {}
 
 @st.cache_data(ttl=10)
-def fetch_orderbook(symbol="BTCUSDT", limit=50) -> dict:
-    """Fetch order book depth."""
+def fetch_orderbook(symbol="XBTUSD", limit=50) -> dict:
+    """Fetch order book depth from Kraken."""
     try:
-        r = requests.get(f"{BINANCE}/depth",
-                         params={"symbol": symbol, "limit": limit},
+        r = requests.get(f"{KRAKEN}/Depth",
+                         params={"pair": symbol, "count": limit},
                          headers=HEADERS, timeout=8)
         r.raise_for_status()
-        data = r.json()
-        bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
-        asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+        data   = r.json()
+        result = data.get("result", {})
+        key    = list(result.keys())[0]
+        book   = result[key]
+        bids   = [(float(p), float(q)) for p, q, _ in book.get("bids", [])]
+        asks   = [(float(p), float(q)) for p, q, _ in book.get("asks", [])]
         return {"bids": bids, "asks": asks}
     except Exception:
         return {"bids": [], "asks": []}
@@ -839,9 +859,9 @@ st.markdown("---")
 #  FETCH ALL DATA
 # ─────────────────────────────────────────────────────────────────
 with st.spinner("Fetching live data..."):
-    df_5m    = fetch_candles("BTCUSDT", "5m",  candle_limit)
-    ticker   = fetch_ticker("BTCUSDT")
-    ob       = fetch_orderbook("BTCUSDT", 100)
+    df_5m    = fetch_candles("XBTUSD", 5, candle_limit)
+    ticker   = fetch_ticker("XBTUSD")
+    ob       = fetch_orderbook("XBTUSD", 100)
     fg       = fetch_fear_greed()
     news     = fetch_news() if use_sent else []
     pm_mkts  = fetch_polymarket_btc()
@@ -905,17 +925,19 @@ with pred_col:
     """, unsafe_allow_html=True)
 
     # Score bars
+    bull_sc = prediction.get('bull_score', 0)
+    bear_sc = prediction.get('bear_score', 0)
     st.markdown(f"""
     <div style="margin-bottom:12px;">
       <div class="bar-row">
         <span class="bar-name">BULL</span>
-        <div class="bar-track"><div class="bar-fill-bull" style="width:{min(prediction['bull_score']/8,100)}%"></div></div>
-        <span class="bar-score">{prediction['bull_score']}</span>
+        <div class="bar-track"><div class="bar-fill-bull" style="width:{min(bull_sc/8,100)}%"></div></div>
+        <span class="bar-score">{bull_sc}</span>
       </div>
       <div class="bar-row">
         <span class="bar-name">BEAR</span>
-        <div class="bar-track"><div class="bar-fill-bear" style="width:{min(prediction['bear_score']/8,100)}%"></div></div>
-        <span class="bar-score">{prediction['bear_score']}</span>
+        <div class="bar-track"><div class="bar-fill-bear" style="width:{min(bear_sc/8,100)}%"></div></div>
+        <span class="bar-score">{bear_sc}</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
